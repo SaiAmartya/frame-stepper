@@ -1,8 +1,23 @@
 # Frame Stepper: frame-by-frame viewer for slow-motion physics lab videos
 
-Opens a video, numbers every frame on screen, and lets you step one frame at a time.
-You mark the release frame and the landing frame, and it works out
-Δt = Δframes ÷ fps (240 by default).
+Opens a video, shows every frame with its frame number and its timestamp, and lets you
+step one frame at a time. You mark the release frame and the landing frame, and it works out
+Δt = END frame's timestamp − START frame's timestamp.
+
+## How the time is measured
+
+Every frame in a video file carries its own timestamp, which is when the camera captured
+it. The program reads that timestamp for each frame and shows it to 0.00001 s, measured
+from the first frame of the file. Δt is the difference between the two marked frames'
+timestamps.
+
+It does **not** use Δframes ÷ fps. iPhone slo-mo frames are often not evenly spaced: a
+"240 fps" clip can mix gaps of 1/240 s and 1/120 s and average about 167 fps, so counting
+frames and dividing by 240 can be wrong by a few hundredths of a second. Frame numbers are
+only there to identify frames.
+
+Δt is worked out from the unrounded timestamps, so it can differ by 0.00001 s from
+subtracting the two displayed times by hand.
 
 ## Setup (one time)
 
@@ -19,8 +34,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 
 A file picker opens in Downloads, which is where AirDrop saves files. You can also pass
-the file and the fps directly:
-`.venv/bin/python frame_stepper.py ~/Downloads/IMG_1234.MOV --fps 240`
+the file directly:
+`.venv/bin/python frame_stepper.py ~/Downloads/IMG_1234.MOV`
 
 Frames are numbered **from 0**, so the first frame of the file is Frame 0. The program
 decodes every frame once, in order, and keeps them in memory, so frame N is exactly the Nth
@@ -43,26 +58,31 @@ frame. It never guesses by seeking. You can start stepping while it is still loa
 | P | export the current frame as a full-resolution labelled PNG |
 | Space | slow playback, R rotate, Q quit |
 
-The fps box at the bottom changes the fps used for Δt. Saved trials go to
-`<video name>_trials.csv`, next to the video, with these columns: trial, start_frame, end_frame,
-delta_frames, fps_used, delta_t_s, and file_timestamp_delta_t_s. PNGs are saved as
-`<video name>_frame00123.png` in the same place.
+Saved trials go to `<video name>_trials.csv`, next to the video, with these columns: trial,
+video, start_frame, end_frame, start_time_s, end_time_s, delta_t_s, and saved_at. Here
+delta_t_s = end_time_s − start_time_s. PNGs are saved as `<video name>_frame00123.png` in
+the same place.
+
+A trials CSV made by an older version (where delta_t_s was Δframes ÷ fps) is converted the
+next time you save a trial: its timestamp-based Δt is kept as delta_t_s, and the untouched
+original is copied to `<video name>_trials_old_format.csv`.
 
 ## Important: send the ORIGINAL slo-mo from the iPhone
 
 A normal AirDrop of a slo-mo video can send a re-rendered copy instead. That copy plays
-at about 30 fps and the slow part is stretched out, so the frames are not reliably
-1/240 s apart. To get the real 240 fps file, go to **Share → Options → turn on "All Photos
-Data"** before you AirDrop. On a Mac with iCloud Photos, you can also use
-File → Export → Export Unmodified Original.
+at about 30 fps with the slow part stretched out, so its timestamps are playback times,
+not the real capture times, and Δt would be wrong. To get the original file, go to
+**Share → Options → turn on "All Photos Data"** before you AirDrop. On a Mac with iCloud
+Photos, you can also use File → Export → Export Unmodified Original.
 
-When a video finishes loading, the program prints its frame rate, its frame count, and
-whether the timestamps are evenly spaced. If the file does not look like a ~240 fps
-original, you get a warning. A good file shows something like
-"Frame rate from timestamps: 240.00 fps … evenly spaced".
+When a video finishes loading, the program prints its frame count and the spacing between
+frames. If the frames are unevenly spaced it says so, and that is fine, because Δt uses
+the timestamps. If the file looks like a ~30 fps re-rendered copy rather than a high-speed
+original, you get a warning.
 
 ## Built-in Mac option (no frame numbers)
 
 You can also step through frames in QuickTime Player. Pause the video, then press → or ←
 to move one frame at a time. Option + ← / → jumps to the start or end. QuickTime does not
-show frame numbers, so you have to count the steps yourself. That is why this tool exists.
+show frame numbers or per-frame timestamps, and counting steps assumes evenly spaced
+frames. That is why this tool exists.

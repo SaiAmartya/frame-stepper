@@ -6,9 +6,14 @@ Every frame is decoded once, in order, and kept in memory, so frame N is
 always the Nth frame of the video (no inaccurate seeking). Frames are
 numbered from 0 (the first frame of the file is "Frame 0").
 
+Times come from the timestamp stored in the file for each frame, so
+Δt = (END frame's timestamp) - (START frame's timestamp). No frame rate is
+assumed: iPhone slo-mo frames are often not evenly spaced, which makes
+"frames ÷ fps" wrong.
+
 Usage:
     .venv/bin/python frame_stepper.py                 # opens a file picker
-    .venv/bin/python frame_stepper.py path/to/video.MOV --fps 240
+    .venv/bin/python frame_stepper.py path/to/video.MOV
 
 Keys:
     Right / Left          next / previous frame
@@ -18,7 +23,7 @@ Keys:
     S / E                 mark START (release) / END (landing) at this frame
     [ / ]                 jump to the START / END mark
     X                     clear both marks
-    Return                save this trial (start, end, frames, time) to CSV
+    Return                save this trial (start/end frame and time, Δt) to CSV
     P                     export the current frame as a labelled PNG
     Space                 play / pause (slow playback)
     R                     rotate the view 90 degrees
@@ -30,6 +35,7 @@ import argparse
 import csv
 import datetime as _dt
 import io
+import shutil
 import statistics
 import sys
 import threading
@@ -56,6 +62,21 @@ FONT_CANDIDATES = [
     "/System/Library/Fonts/Monaco.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
 ]
+CSV_FIELDS = ["trial", "video", "start_frame", "end_frame", "start_time_s",
+              "end_time_s", "delta_t_s", "saved_at"]
+# Below this frame rate a file is not a high-speed capture (e.g. the ~30 fps
+# re-rendered copy an iPhone can share instead of the original slo-mo).
+MIN_SLOMO_FPS = 100.0
+
+
+def upgrade_row(old):
+    """Convert a CSV row saved by an older version to CSV_FIELDS. Older files
+    stored frames ÷ fps as delta_t_s and the timestamp difference as
+    file_timestamp_delta_t_s; only the timestamp difference is kept."""
+    new = {k: old.get(k) or "" for k in CSV_FIELDS}
+    if "file_timestamp_delta_t_s" in old:
+        new["delta_t_s"] = old["file_timestamp_delta_t_s"] or ""
+    return new
 
 
 # --------------------------------------------------------------------------
@@ -120,6 +141,7 @@ class VideoCache:
         self.frames = []      # JPEG bytes, index = frame number
         self.times = []       # seconds since the first frame (from file timestamps)
         self.pts = []         # raw timestamps (used for full-resolution export)
+        self.estimated_times = False   # True if a frame had no timestamp
         self.done = False
         self.error = None
         self._stop = False
@@ -177,6 +199,7 @@ class VideoCache:
                     return
                 t = frame.time
                 if t is None:
+                    self.estimated_times = True
                     fps = self.nominal_fps or 240.0
                     t = i / fps
                 if t0 is None:
@@ -214,47 +237,53 @@ class VideoCache:
 
     # ---- timing analysis -------------------------------------------------
     def timing_report(self):
-        """Return (lines, warnings) describing frame rate / variable timing."""
+        """Return (lines, warnings, summary) describing the frame timing."""
         n = len(self.times)
-        lines, warns = [], []
+        lines = [f"Frames decoded: {n}   (numbered 0 to {n - 1})"]
+        warns, summary = [], ""
+        if self.estimated_times:
+            warns.append("Some frames in this file have no timestamp, so their times were "
+                         "estimated from the nominal frame rate. Δt may be wrong.")
         d = [b - a for a, b in zip(self.times, self.times[1:])]
         d = [x for x in d if x > 0]
-        ts_fps = None
         if d:
             med = statistics.median(d)
-            ts_fps = 1.0 / med if med > 0 else None
+            med_fps = 1.0 / med
+            avg_fps = len(d) / sum(d)
             off = sum(1 for x in d if abs(x - med) > 0.1 * med)
-            vfr = off > max(2, 0.01 * len(d))
-            lines.append(f"Frames decoded: {n}   (numbered 0 to {n - 1})")
             lines.append(
-                f"Frame rate from timestamps: {ts_fps:.2f} fps (median spacing "
-                f"{med * 1000:.3f} ms; min {min(d) * 1000:.3f}, max {max(d) * 1000:.3f})"
+                f"Frame spacing from timestamps: median {med * 1000:.3f} ms "
+                f"({med_fps:.1f} fps), min {min(d) * 1000:.3f} ms, "
+                f"max {max(d) * 1000:.3f} ms; average {avg_fps:.1f} fps"
             )
-            if vfr:
-                lines.append(f"Timestamps look VARIABLE: {off} of {len(d)} gaps differ "
-                             f">10% from the median.")
-                warns.append("Timestamps are variable (VFR). This often means the iPhone "
-                             "rendered/retimed the slo-mo when sharing it.")
+            if off > max(2, 0.01 * len(d)):
+                lines.append(f"Frames are UNEVENLY spaced: {off} of {len(d)} gaps differ "
+                             ">10% from the median. That is fine: Δt is the difference "
+                             "of the two marked frames' own timestamps, not frames ÷ fps.")
+                summary = (f"Frames are unevenly spaced (average {avg_fps:.0f} fps). "
+                           "That is fine: Δt uses each frame's own timestamp.")
             else:
-                lines.append("Timestamps look evenly spaced (constant frame rate).")
-        fps_guess = ts_fps or self.nominal_fps
-        if fps_guess and not (200 <= fps_guess <= 260):
-            warns.append(
-                f"This file plays at about {fps_guess:.0f} fps, not ~240 fps, so it is "
-                "probably NOT the original slo-mo capture. Re-send it from the iPhone with "
-                "AirDrop > Options > 'All Photos Data' ON (or export the Unmodified Original)."
-            )
-        return lines, warns
+                lines.append("Frames are evenly spaced.")
+                summary = f"{med_fps:.1f} fps, evenly spaced."
+            if med_fps < MIN_SLOMO_FPS:
+                warns.append(
+                    f"Most frames in this file are {med * 1000:.1f} ms apart (about "
+                    f"{med_fps:.0f} fps), so it is not a high-speed capture. If it was "
+                    "filmed in slo-mo, this is probably a re-rendered copy: its "
+                    "timestamps are playback times, not real times, so Δt would be "
+                    "wrong. Re-send it from the iPhone with AirDrop > Options > 'All "
+                    "Photos Data' ON (or export the Unmodified Original)."
+                )
+        return lines, warns, summary
 
 
 # --------------------------------------------------------------------------
 # GUI
 # --------------------------------------------------------------------------
 class App:
-    def __init__(self, root, path, fps=240.0, csv_path=None, play_fps=30, max_size=None):
+    def __init__(self, root, path, csv_path=None, play_fps=30, max_size=None):
         self.root = root
         self.path = Path(path)
-        self.fps = float(fps)
         self.play_fps = play_fps
         self.idx = 0
         self.start_mark = None
@@ -296,15 +325,9 @@ class App:
         bar = tk.Frame(r)
         bar.pack(side="top", fill="x", padx=8, pady=2)
         self.info = tk.Label(bar, text="", font=("Menlo", 13), anchor="w", justify="left",
-                             wraplength=max(500, self.cache.disp_w - 260))
+                             wraplength=max(500, self.cache.disp_w - 160))
         self.info.pack(side="left", fill="x", expand=True)
 
-        tk.Label(bar, text="fps:").pack(side="left")
-        self.fps_var = tk.StringVar(value=f"{self.fps:g}")
-        self.fps_entry = tk.Entry(bar, textvariable=self.fps_var, width=6)
-        self.fps_entry.pack(side="left")
-        self.fps_entry.bind("<Return>", self._apply_fps)
-        self.fps_entry.bind("<FocusOut>", self._apply_fps)
         tk.Label(bar, text="  go to:").pack(side="left")
         self.goto_var = tk.StringVar()
         self.goto_entry = tk.Entry(bar, textvariable=self.goto_var, width=7)
@@ -390,19 +413,6 @@ class App:
         self.view.focus_set()
         return "break"
 
-    def _apply_fps(self, _event=None):
-        try:
-            v = float(self.fps_var.get())
-            if v <= 0:
-                raise ValueError
-            self.fps = v
-        except ValueError:
-            self.fps_var.set(f"{self.fps:g}")
-        self._update_info()
-        if _event is not None and _event.type == tk.EventType.KeyPress:
-            self.view.focus_set()
-        return None
-
     def toggle_play(self):
         self.playing = not self.playing
         if self.playing:
@@ -435,48 +445,67 @@ class App:
         self._request_render()
 
     def delta(self):
-        """(delta_frames, delta_t_seconds, delta_t_from_file) or None."""
+        """Δt in seconds = END frame's timestamp - START frame's timestamp,
+        or None until both marks are set."""
         if self.start_mark is None or self.end_mark is None:
             return None
-        df = self.end_mark - self.start_mark
-        dt_file = self.cache.times[self.end_mark] - self.cache.times[self.start_mark]
-        return df, df / self.fps, dt_file
+        return self.cache.times[self.end_mark] - self.cache.times[self.start_mark]
+
+    def _mark_text(self, mark):
+        if mark is None:
+            return "-"
+        return f"frame {mark} @ {self.cache.times[mark]:.5f} s"
 
     def save_trial(self):
-        d = self.delta()
-        if d is None:
+        dt = self.delta()
+        if dt is None:
             self.flash("Mark START (S) and END (E) first.")
             return
-        df, dt, dt_file = d
-        new = not self.csv_path.exists()
-        trial = 1
-        if not new:
-            with open(self.csv_path, newline="") as f:
-                trial = sum(1 for _ in csv.DictReader(f)) + 1
-        row = {
-            "trial": trial,
-            "video": self.path.name,
-            "start_frame": self.start_mark,
-            "end_frame": self.end_mark,
-            "delta_frames": df,
-            "fps_used": f"{self.fps:g}",
-            "delta_t_s": f"{dt:.5f}",
-            "file_timestamp_delta_t_s": f"{dt_file:.5f}",
-            "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        }
+        t_start = self.cache.times[self.start_mark]
+        t_end = self.cache.times[self.end_mark]
+        rows, header, note = [], None, ""
         try:
-            with open(self.csv_path, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=list(row))
-                if new:
+            if self.csv_path.exists():
+                with open(self.csv_path, newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+                    header = reader.fieldnames
+            trial = len(rows) + 1
+            row = {
+                "trial": trial,
+                "video": self.path.name,
+                "start_frame": self.start_mark,
+                "end_frame": self.end_mark,
+                "start_time_s": f"{t_start:.5f}",
+                "end_time_s": f"{t_end:.5f}",
+                "delta_t_s": f"{dt:.5f}",
+                "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            }
+            if header == CSV_FIELDS:
+                with open(self.csv_path, "a", newline="") as f:
+                    csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
+            else:
+                if header:   # CSV from an older version: keep a copy, then convert
+                    backup = self.csv_path.with_name(
+                        self.csv_path.stem + "_old_format.csv")
+                    if not backup.exists():
+                        shutil.copy2(self.csv_path, backup)
+                    rows = [upgrade_row(r) for r in rows]
+                    note = f"  (older CSV converted; copy kept as {backup.name})"
+                tmp = self.csv_path.with_name(self.csv_path.name + ".tmp")
+                with open(tmp, "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
                     w.writeheader()
-                w.writerow(row)
-        except OSError as exc:
-            self.flash(f"Could not write CSV: {exc}")
+                    w.writerows(rows + [row])
+                tmp.replace(self.csv_path)
+        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            self.flash(f"Could not save to CSV: {exc}", "#c00")
             return
-        msg = (f"Trial {trial}: start {self.start_mark}, end {self.end_mark}, "
-               f"Δframes {df}, Δt = {df}/{self.fps:g} = {dt:.5f} s")
-        print(msg + f"   -> {self.csv_path}", flush=True)
-        self.flash(f"Saved. {msg}")
+        msg = (f"Trial {trial}: START frame {self.start_mark} @ {t_start:.5f} s, "
+               f"END frame {self.end_mark} @ {t_end:.5f} s, "
+               f"Δt = {dt:.5f} s (END time − START time)")
+        print(msg + f"   -> {self.csv_path}{note}", flush=True)
+        self.flash(f"Saved. {msg}{note}")
 
     def export_png(self):
         if self.loaded == 0:
@@ -503,8 +532,8 @@ class App:
         n = self.loaded
         total = n if self.cache.done else f"{n}+"
         lines = [f"Frame {i}  (0-based, of {total})",
-                 f"t = {self.cache.times[i]:.5f} s (file)"]
-        colors = [None, (200, 200, 200)]
+                 f"t = {self.cache.times[i]:.5f} s (file timestamp)"]
+        colors = [None, None]
         tags = []
         if i == self.start_mark:
             tags.append("START mark")
@@ -513,15 +542,15 @@ class App:
         if tags:
             lines.append(" + ".join(tags))
             colors.append((0, 255, 120))
-        if include_delta and (self.start_mark is not None or self.end_mark is not None):
-            s = "-" if self.start_mark is None else self.start_mark
-            e = "-" if self.end_mark is None else self.end_mark
-            line = f"S={s}  E={e}"
-            d = self.delta()
-            if d:
-                line += f"  Δ={d[0]} fr  Δt={d[1]:.4f} s"
-            lines.append(line)
-            colors.append((120, 200, 255))
+        if include_delta:
+            for name, mark in (("START", self.start_mark), ("END  ", self.end_mark)):
+                if mark is not None:
+                    lines.append(f"{name} {self._mark_text(mark)}")
+                    colors.append((120, 200, 255))
+            dt = self.delta()
+            if dt is not None:
+                lines.append(f"Δt = {dt:.5f} s")
+                colors.append((120, 200, 255))
         return lines, colors
 
     def _request_render(self):
@@ -546,14 +575,12 @@ class App:
     def _update_info(self):
         if self.loaded == 0:
             return
-        txt = f"Frame {self.idx}   t={self.cache.times[self.idx]:.5f}s"
-        d = self.delta()
-        s = "-" if self.start_mark is None else self.start_mark
-        e = "-" if self.end_mark is None else self.end_mark
-        txt += f"   |   START {s}   END {e}"
-        if d:
-            txt += (f"   Δframes {d[0]}   Δt = {d[0]}/{self.fps:g} = {d[1]:.5f} s"
-                    f"   (file timestamps: {d[2]:.5f} s)")
+        txt = (f"Frame {self.idx}   t = {self.cache.times[self.idx]:.5f} s"
+               f"   |   START {self._mark_text(self.start_mark)}"
+               f"   END {self._mark_text(self.end_mark)}")
+        dt = self.delta()
+        if dt is not None:
+            txt += f"   |   Δt = {dt:.5f} s (END time − START time)"
         self.info.configure(text=txt)
 
     def flash(self, msg, color="#0a7"):
@@ -581,7 +608,7 @@ class App:
         if not self._reported:
             self._reported = True
             self._request_render()
-            lines, warns = c.timing_report()
+            lines, warns, summary = c.timing_report()
             print("\n".join("  " + x for x in lines), flush=True)
             for w in warns:
                 print("  WARNING: " + w, flush=True)
@@ -593,7 +620,7 @@ class App:
                 messagebox.showwarning("Check the video", "\n\n".join(warns))
                 self.view.focus_set()
             else:
-                self.flash(msg + f"  ~{1 / statistics.median([b - a for a, b in zip(c.times, c.times[1:])] or [1 / self.fps]):.1f} fps, evenly spaced.")
+                self.flash(f"{msg}  {summary}")
 
     def _print_header(self):
         c = self.cache
@@ -602,13 +629,11 @@ class App:
               f"shown at {c.disp_w}x{c.disp_h}", flush=True)
         nf = f"{c.nominal_fps:.3f}" if c.nominal_fps else "?"
         dur = f"{c.duration:.3f} s" if c.duration else "?"
-        print(f"  nominal frame rate {nf} fps, frames (header) {c.stream_frames or '?'}, "
-              f"duration {dur}", flush=True)
-        print(f"  Δt uses fps = {self.fps:g} (change with --fps or the fps box)", flush=True)
+        print(f"  average frame rate (header) {nf} fps, frames (header) "
+              f"{c.stream_frames or '?'}, duration {dur}", flush=True)
+        print("  Δt = END frame's timestamp − START frame's timestamp "
+              "(read from the file; no frame rate is assumed)", flush=True)
         print(f"  trials CSV: {self.csv_path}", flush=True)
-        if c.nominal_fps and not (200 <= c.nominal_fps <= 260):
-            print("  WARNING: nominal frame rate is not ~240 fps; this may be the "
-                  "rendered slo-mo, not the original (see README).", flush=True)
 
     def quit(self):
         self.playing = False
@@ -620,13 +645,14 @@ class App:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Frame-by-frame viewer with frame numbers.")
     ap.add_argument("video", nargs="?", help="video file (omit to pick one)")
-    ap.add_argument("--fps", type=float, default=240.0,
-                    help="capture frame rate used for Δt = Δframes / fps (default 240)")
+    ap.add_argument("--fps", type=float, help=argparse.SUPPRESS)   # no longer used
     ap.add_argument("--csv", help="CSV file for saved trials (default: <video>_trials.csv)")
     ap.add_argument("--play-fps", type=float, default=30.0, help="Space-bar playback speed")
     ap.add_argument("--max-size", type=int,
                     help="max on-screen width/height in pixels (default: fit the screen)")
     args = ap.parse_args(argv)
+    if args.fps is not None:
+        print("Note: --fps is ignored. Δt now comes from each frame's own timestamp.")
 
     root = tk.Tk()
     path = args.video
@@ -645,7 +671,7 @@ def main(argv=None):
         print(f"File not found: {path}")
         return 1
     try:
-        App(root, path, fps=args.fps, csv_path=args.csv, play_fps=args.play_fps,
+        App(root, path, csv_path=args.csv, play_fps=args.play_fps,
             max_size=args.max_size)
     except av.error.FFmpegError as exc:
         messagebox.showerror("Could not open video", str(exc))
